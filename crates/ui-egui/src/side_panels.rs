@@ -368,8 +368,47 @@ fn open_panes(app: &PdfCraftApp) -> Vec<Pane> {
     open
 }
 
+/// The pane to close so that one pane shows in the narrow layout: the one that was already open
+/// last frame, so opening a pane closes the other. When both were open (the window just got
+/// narrow), the Tools pane closes.
+fn pane_to_close(open: &[Pane], last: &[Pane]) -> Option<Pane> {
+    if open.len() < 2 {
+        return None;
+    }
+    if last.contains(&Pane::Side) && !last.contains(&Pane::Tools) { Some(Pane::Side) } else { Some(Pane::Tools) }
+}
+
+/// The narrow layout's rules: the Tools pane starts closed, and one pane shows at a time.
+fn keep_one_pane(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    let width = ctx.content_rect().width();
+    // A window with no size yet decides nothing, not even how the app starts.
+    if width.is_nan() || width <= 0.0 {
+        return;
+    }
+    let started = egui::Id::unique("pdfcraft-narrow-started");
+    let last_id = egui::Id::unique("pdfcraft-narrow-last-panes");
+    let first = !ctx.data(|data| data.get_temp::<bool>(started).unwrap_or(false));
+    ctx.data_mut(|data| data.insert_temp(started, true));
+    if !crate::chrome::is_narrow(width) {
+        ctx.data_mut(|data| data.remove::<Vec<Pane>>(last_id));
+        return;
+    }
+    if first {
+        app.left_open = false;
+    }
+    let last = ctx.data(|data| data.get_temp::<Vec<Pane>>(last_id)).unwrap_or_default();
+    match pane_to_close(&open_panes(app), &last) {
+        Some(Pane::Tools) => app.left_open = false,
+        Some(Pane::Side) => app.choose_right_panel(None),
+        None => {}
+    }
+    let shown = open_panes(app);
+    ctx.data_mut(|data| data.insert_temp(last_id, shown));
+}
+
 /// Draws the rail and the open panes. Call after the top bars and before the central panel.
 pub fn show(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+    keep_one_pane(app, ui.ctx());
     if let Some(panel) = app.right {
         app.last_right = panel;
     }
@@ -511,6 +550,17 @@ mod tests {
             deep = split(json!({"Ratio": 0.5}), tabs(&["canvas"]), deep);
         }
         assert_eq!(restore(&workspace(deep, json!([]), json!([]))).panels.tools_side, ToolsSide::Left);
+    }
+
+    #[test]
+    fn narrow_layout_keeps_the_pane_opened_last() {
+        use Pane::{Side, Tools};
+        assert_eq!(pane_to_close(&[], &[]), None);
+        assert_eq!(pane_to_close(&[Tools], &[Side]), None);
+        assert_eq!(pane_to_close(&[Tools, Side], &[Tools]), Some(Tools), "opening the side panel closes Tools");
+        assert_eq!(pane_to_close(&[Tools, Side], &[Side]), Some(Side), "opening Tools closes the side panel");
+        assert_eq!(pane_to_close(&[Tools, Side], &[Tools, Side]), Some(Tools), "a window turning narrow keeps the side panel");
+        assert_eq!(pane_to_close(&[Tools, Side], &[]), Some(Tools));
     }
 
     #[test]

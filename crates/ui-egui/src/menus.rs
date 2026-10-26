@@ -26,6 +26,11 @@ const ROW_AFTER_MENUS: f32 = 720.0;
 /// The narrowest the menu bar gets: one "Menu" title.
 const MIN_MENUS_WIDTH: f32 = 80.0;
 
+/// The top bar's width after the menus in the layout `narrow` picks ([`crate::chrome::narrow`]).
+fn row_after_menus(narrow: bool) -> f32 {
+    if narrow { crate::chrome::NARROW_ROW_AFTER_MENUS } else { ROW_AFTER_MENUS }
+}
+
 /// Menu-only commands. The registry's commands keep their own ids.
 pub(crate) const CUT: &str = "edit.cut";
 pub(crate) const PASTE: &str = "edit.paste";
@@ -565,7 +570,7 @@ impl PdfCraftApp {
         let gate = self.menu_gate(&ctx);
         // The mode tabs, search and buttons follow the bar in the same row: it takes its titles'
         // width, less when the row is short, where the menus that don't fit move into its "⋯".
-        let fit = (ui.available_width() - ROW_AFTER_MENUS).max(MIN_MENUS_WIDTH);
+        let fit = (ui.available_width() - row_after_menus(crate::chrome::narrow(&ctx))).max(MIN_MENUS_WIDTH);
         let chosen = craft_menu::MenuBarUi::new(&bar)
             .gate(gate)
             .label(&translate)
@@ -652,6 +657,16 @@ mod tests {
 
     fn item<'b>(bar: &'b MenuBar, command: &CommandRef) -> &'b Item {
         bar.find(command).unwrap_or_else(|| panic!("{} is in the menus", command.key()))
+    }
+
+    #[test]
+    fn the_narrow_top_bar_leaves_the_menus_room_on_a_phone() {
+        assert!(crate::chrome::is_narrow(411.0), "a phone held upright");
+        assert!(!crate::chrome::is_narrow(914.0), "a phone on its side keeps the desktop bar");
+        assert!(!crate::chrome::is_narrow(f32::NAN));
+        assert_eq!(row_after_menus(false), ROW_AFTER_MENUS, "the desktop bar is unchanged");
+        let margins = 20.0;
+        assert!(411.0 - margins - row_after_menus(true) >= MIN_MENUS_WIDTH, "{}", row_after_menus(true));
     }
 
     #[test]

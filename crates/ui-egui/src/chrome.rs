@@ -27,6 +27,29 @@ const TAB_STRIP: f32 = 38.0;
 const TAB_HEIGHT: f32 = 30.0;
 const STRIP_BUTTON: f32 = 28.0;
 
+/// Below this window width, in points, the top bar and the side panes take their narrow (phone)
+/// layout: the mode tabs fold into one menu, search becomes a button and one side pane shows.
+pub const NARROW_WIDTH: f32 = 700.0;
+/// The mode bar's tabs. Acrobat's mode bar has no Read tab: reading is what the viewer does with
+/// no tool in use. Read mode (the panes hidden) stays a View command and a default workspace.
+const MODES: [(Mode, &str); 4] = [(Mode::AllTools, "All tools"), (Mode::Edit, "Edit"), (Mode::Convert, "Convert"), (Mode::Sign, "E-Sign")];
+const MODE_MENU_WIDTH: f32 = 128.0;
+const BAR_BUTTON: f32 = 32.0;
+/// The narrow top bar's width after the menus: the divider and its gaps, the mode menu with its
+/// padding, the gap before the buttons, and search, info, save and print 4 apart.
+pub const NARROW_ROW_AFTER_MENUS: f32 = 17.0 + MODE_MENU_WIDTH + 12.0 + 8.0 + 4.0 * BAR_BUTTON + 3.0 * 4.0;
+
+/// Whether a window `width` points wide gets the narrow layout. A width that isn't a number
+/// keeps the desktop layout.
+pub fn is_narrow(width: f32) -> bool {
+    width < NARROW_WIDTH
+}
+
+/// [`is_narrow`] for the window `ctx` draws.
+pub fn narrow(ctx: &egui::Context) -> bool {
+    is_narrow(ctx.content_rect().width())
+}
+
 /// Draw the window's tab strip: home and open controls, shrinkable and scrollable document tabs with drag
 /// reordering, and platform window controls.
 pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
@@ -485,11 +508,14 @@ pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     ui.painter().vline(ui.cursor().left(), ui.max_rect().y_range().shrink(12.0), Stroke::new(1.0, t.divider));
                     ui.add_space(10.0);
                 }
-                // Acrobat's mode bar has no Read tab: reading is what the viewer does with no tool
-                // in use. Read mode (the panes hidden) stays a View command and a default workspace.
-                for (mode, label) in [(Mode::AllTools, "All tools"), (Mode::Edit, "Edit"), (Mode::Convert, "Convert"), (Mode::Sign, "E-Sign")] {
-                    if widgets::mode_tab(ui, tl!(label), app.mode == mode).clicked() {
-                        app.switch_mode(mode, true);
+                let narrow = narrow(ui.ctx());
+                if narrow {
+                    mode_menu(app, ui);
+                } else {
+                    for (mode, label) in MODES {
+                        if widgets::mode_tab(ui, tl!(label), app.mode == mode).clicked() {
+                            app.switch_mode(mode, true);
+                        }
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -516,12 +542,34 @@ pub fn mode_bar(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         }
                     });
                     ui.add_space(8.0);
-                    if widgets::search_box(ui, tl!("Find tools and commands"), 260.0).clicked() {
+                    let search = if narrow {
+                        icons::button(ui, "search", BAR_BUTTON, false, tl!("Find tools and commands"))
+                    } else {
+                        widgets::search_box(ui, tl!("Find tools and commands"), 260.0)
+                    };
+                    if search.clicked() {
                         app.palette_open = true;
                     }
                 });
             });
         });
+}
+
+/// The mode tabs folded into one menu for the narrow layout, showing the current mode.
+fn mode_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+    let current = MODES.iter().find(|(mode, _)| *mode == app.mode).map_or("Read mode", |(_, label)| *label);
+    let mut chosen = None;
+    egui::ComboBox::from_id_salt("mode-menu").selected_text(tl!(current)).width(MODE_MENU_WIDTH).show_ui(ui, |ui| {
+        for (mode, label) in MODES {
+            if ui.selectable_label(app.mode == mode, tl!(label)).clicked() {
+                chosen = Some(mode);
+                ui.close();
+            }
+        }
+    });
+    if let Some(mode) = chosen {
+        app.switch_mode(mode, true);
+    }
 }
 
 /// Draw the right tool rail with page navigation, history, zoom, rotation and page-display controls for the

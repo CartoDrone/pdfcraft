@@ -7,11 +7,12 @@
 
 use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, vec2};
 use pdfcraft_engine::form_scripts::{CalcOp, Calculate, DATE_PRESETS, Format, TIME_PRESETS, Validate, format_value};
-use pdfcraft_engine::{BorderStyle, Edit, FieldFont, FieldLook, FieldProps, FormField, FormFieldKind, NewField};
+use pdfcraft_engine::{BorderStyle, Document, Edit, FieldFont, FieldLook, FieldProps, FormField, FormFieldKind, NewField};
 use pdfcraft_render::DocInfo;
 
 use crate::canvas::{DocView, PageXform};
 use crate::comments;
+use crate::page_pointer::PagePointer;
 use crate::theme;
 use crate::widgets;
 
@@ -150,6 +151,13 @@ pub struct PrepareView {
 }
 
 impl PrepareView {
+    /// Cancel a preparation marquee without injecting the terminal pointer release that Escape does.
+    pub(crate) fn cancel_pointer_gesture(&mut self) {
+        cancel_marquee(self);
+        // Unlike Escape, control cancellation never injects a terminal pointer release.
+        self.ignore_release = false;
+    }
+
     /// Unique field names: selecting several widgets of one radio group still edits one field.
     pub fn names(&self) -> Vec<String> {
         let mut names = Vec::new();
@@ -242,6 +250,7 @@ pub(crate) fn page_input(
     ui: &egui::Ui,
     resp: &egui::Response,
     xf: &PageXform,
+    ptr: &PagePointer,
     page: usize,
     info: &DocInfo,
     form: &[FormField],
@@ -250,7 +259,7 @@ pub(crate) fn page_input(
     view: &mut DocView,
 ) -> Outcome {
     let mut out = Outcome { consumed: false, properties: false, placed: false, table: None };
-    let pointer = ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
+    let pointer = ptr.pos;
     let prep = &mut view.prepare;
 
     if prep.marquee_before.is_some() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -259,7 +268,7 @@ pub(crate) fn page_input(
         return out;
     }
     if prep.ignore_release {
-        if !ui.input(|i| i.pointer.primary_down()) {
+        if !ptr.primary_down {
             prep.ignore_release = false;
         }
         out.consumed = true;
@@ -271,7 +280,7 @@ pub(crate) fn page_input(
         && gp == page
     {
         out.consumed = true;
-        if resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+        if resp.drag_stopped() || !ptr.primary_down {
             prep.grab = None;
             let end = pointer.unwrap_or(start);
             match grab {
@@ -337,7 +346,7 @@ pub(crate) fn page_input(
     if let Some(tool) = tool {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         if resp.drag_started() || resp.clicked() {
-            let origin = ui.input(|i| i.pointer.press_origin()).filter(|o| xf.rect.contains(*o)).unwrap_or(p);
+            let origin = ptr.origin.filter(|o| xf.rect.contains(*o)).unwrap_or(p);
             prep.grab = Some((page, Grab::Draw(origin), origin));
             out.consumed = true;
             if resp.clicked() {
@@ -393,7 +402,7 @@ pub(crate) fn page_input(
         ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
     }
     if resp.drag_started() {
-        let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
+        let origin = ptr.origin.unwrap_or(p);
         if let Some((_, left, top)) = selected_rect.and_then(|r| handles(r).into_iter().find(|(c, ..)| c.distance(origin) <= 6.0)) {
             prep.grab = Some((page, Grab::Corner(left, top), origin));
             out.consumed = true;
@@ -538,12 +547,21 @@ pub fn arrange(form: &[FormField], anchor: &(String, usize), others: &[(String, 
 }
 
 /// Fields with their light-blue fill and name tags, the selection with its handles, and the
-/// rectangle being drawn or dragged.
-pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform, page: usize, info: &DocInfo, form: &[FormField], view: &DocView) {
+/// rectangle being drawn or dragged to the pages' `pointer`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_page(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    xf: &PageXform,
+    page: usize,
+    info: &DocInfo,
+    form: &[FormField],
+    view: &DocView,
+    pointer: Option<Pos2>,
+) {
     let prep = &view.prepare;
-    let pointer = ui.input(|i| i.pointer.hover_pos());
     let grab = prep.grab.filter(|(gp, ..)| *gp == page);
-    let zoom = (xf.rect.width() / xf.pw.max(1.0)).clamp(0.5, 3.0);
+    let zoom = xf.zoom().clamp(0.5, 3.0);
     for f in form {
         for (wi, w) in f.widgets.iter().enumerate().filter(|(_, w)| w.page == Some(page)) {
             let mut r = screen_rect(xf, info, page, w.rect);
@@ -560,7 +578,8 @@ pub(crate) fn paint_page(ui: &egui::Ui, painter: &egui::Painter, xf: &PageXform,
                 egui::StrokeKind::Inside,
             );
             // The name tag: white text on black, clipped to the field.
-            let label = f.name.rsplit('.').next().unwrap_or(&f.name);
+            // The full name, as Acrobat shows it: MASTER.first, not first (#2696).
+            let label = f.name.as_str();
             let font = theme::regular((9.0 * zoom).clamp(7.0, 13.0));
             let galley = painter.layout_no_wrap(label.to_string(), font, Color32::WHITE);
             let size = galley.size() + vec2(6.0, 2.0);
@@ -599,6 +618,53 @@ pub(crate) fn delete_selected(view: &mut DocView) -> Option<Edit> {
     }
     let label = format!("Delete {} fields", names.len());
     Some(Edit::Batch { label, edits: names.into_iter().map(|name| Edit::DeleteField { name }).collect() })
+}
+
+/// The arrow keys move the selected field a point, Shift and an arrow ten points, as in Acrobat,
+/// as the object nudge does (`object_ui::nudge_keys`) and as dragging it does (#2608). The keys
+/// are consumed before the view turns the page with them; one press is one undo step.
+pub(crate) fn nudge_keys(ctx: &egui::Context, view: &mut DocView, doc: &Document) {
+    // `consume_key` lets an extra Alt through, and Alt+↑/↓ belongs to Calculation order's move.
+    if ctx.egui_wants_keyboard_input() || view.prepare.grab.is_some() || ctx.input(|i| i.modifiers.alt) {
+        return;
+    }
+    let Some((name, wi)) = view.prepare.selected.clone() else { return };
+    let Some(w) = doc.form.iter().find(|f| f.name == name).and_then(|f| f.widgets.get(wi)) else { return };
+    let Some(page) = w.page else { return };
+    let Some(xf) = view.page_xform(page) else { return };
+    use egui::{Key, Modifiers};
+    let mut step = egui::Vec2::ZERO;
+    ctx.input_mut(|i| {
+        for (key, direction) in [
+            (Key::ArrowLeft, egui::vec2(-1.0, 0.0)),
+            (Key::ArrowRight, egui::vec2(1.0, 0.0)),
+            (Key::ArrowUp, egui::vec2(0.0, -1.0)),
+            (Key::ArrowDown, egui::vec2(0.0, 1.0)),
+        ] {
+            // Shift first: a plain key pattern also matches a Shift press.
+            if i.consume_key(Modifiers::SHIFT, key) {
+                step += direction * 10.0;
+            } else if i.consume_key(Modifiers::NONE, key) {
+                step += direction;
+            }
+        }
+    });
+    if step == egui::Vec2::ZERO {
+        return;
+    }
+    // A point in view space whatever the zoom and whatever way the view is turned; the page's own
+    // rotation turns it into the user-space move the widget's rect is stored in.
+    let c = xf.rect.center();
+    let unit = |d: egui::Vec2| {
+        let (a, b) = (xf.screen_to_view(c), xf.screen_to_view(c + d));
+        let v = egui::vec2(b.0 - a.0, b.1 - a.1);
+        if v.length() > 0.0 { v / v.length() } else { egui::Vec2::ZERO }
+    };
+    let delta = unit(egui::vec2(1.0, 0.0)) * step.x + unit(egui::vec2(0.0, 1.0)) * step.y;
+    let Ok(offset) = doc.object_move_offset(page, [f64::from(delta.x), f64::from(delta.y)]) else { return };
+    let r = w.rect;
+    let rect = [r[0] + offset[0], r[1] + offset[1], r[2] + offset[0], r[3] + offset[1]];
+    view.pending_edit = Some(Edit::SetFieldProps { name, props: Box::new(FieldProps { rect: Some((wi, rect)), ..Default::default() }) });
 }
 
 /// Delete removes the selected fields; Escape clears the selection.
@@ -693,6 +759,7 @@ impl crate::PdfCraftApp {
             self.session.get(id).map(|doc| doc.form.iter().filter(|x| x.name != name).map(|x| x.name.clone()).collect()).unwrap_or_default();
         d.others = others.clone();
         d.actions = self.session.get(id).map(|doc| doc.field_actions(name)).unwrap_or_default();
+        d.chained = self.session.get(id).map(|doc| doc.field_action_chains(name)).unwrap_or_default();
         if let Some(o) = d.original.as_mut() {
             o.others = others;
             o.actions = d.actions.clone();
@@ -805,6 +872,11 @@ pub struct FieldDraft {
     /// Actions tab: each trigger's action, and the one being added.
     pub actions: Vec<(pdfcraft_engine::FieldTrigger, pdfcraft_engine::FieldAction)>,
     pub new_action: ActionDraft,
+    /// Actions tab: the trigger whose script `new_action` is editing (Edit), if any.
+    pub editing: Option<pdfcraft_engine::FieldTrigger>,
+    /// Actions tab: how many actions the document chains after each trigger's first one. They are
+    /// kept when that first action is replaced.
+    pub chained: Vec<(pdfcraft_engine::FieldTrigger, usize)>,
     original: Box<Option<FieldDraft>>,
 }
 
@@ -840,7 +912,8 @@ impl FieldDraft {
             kind: f.kind,
             widget,
             tab: FieldTab::General,
-            name: f.name.rsplit('.').next().unwrap_or(&f.name).to_string(),
+            // The full name: a dotted name moves the field under those parent fields (#2696).
+            name: f.name.clone(),
             tooltip: f.tooltip.clone().unwrap_or_default(),
             caption: f.widgets.get(widget).and_then(|w| w.caption.clone()).unwrap_or_default(),
             read_only: f.read_only(),
@@ -866,6 +939,8 @@ impl FieldDraft {
             others: Vec::new(),
             actions: Vec::new(),
             new_action: ActionDraft::default(),
+            editing: None,
+            chained: Vec::new(),
             original: Box::new(None),
         };
         d.original = Box::new(Some(d.clone()));
@@ -1025,7 +1100,10 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Toke
                         if ui.add(widgets::checkbox(&mut auto, tl!("Auto"))).changed() {
                             d.font_size = if auto { 0.0 } else { 12.0 };
                         }
-                        ui.add_enabled(!auto, egui::DragValue::new(&mut d.font_size).range(2.0..=100.0).speed(0.25).suffix(" pt"));
+                        ui.add_enabled(
+                            !auto,
+                            egui::DragValue::new(&mut d.font_size).range(2.0..=100.0).clamp_existing_to_range(false).speed(0.25).suffix(" pt"),
+                        );
                     });
                     ui.end_row();
                     if let Some(l) = d.look.as_mut() {
@@ -1300,6 +1378,7 @@ const SEPARATORS: [&str; 5] = ["1,234.56", "1234.56", "1.234,56", "1234,56", "1'
 const NEGATIVES: [&str; 4] = ["-1,234.01", "1,234.01 (red)", "(1,234.01)", "(1,234.01) (red)"];
 const SPECIALS: [&str; 5] = ["Zip Code", "Zip Code + 4", "Phone Number", "Social Security Number", "Arbitrary Mask"];
 
+/// Draw the field-format editor for the selected category and its options.
 fn format_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) {
     let cat = category(&d.format);
     let mut picked = cat;
@@ -1412,8 +1491,8 @@ fn format_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) {
                         ui.selectable_value(p, pr.to_string(), pr);
                     }
                 });
-                ui.label(tl!("Custom:"));
-                ui.add(crate::widgets::line(p).desired_width(120.0));
+                let custom = ui.label(tl!("Custom:"));
+                ui.add(crate::widgets::line(p).desired_width(120.0)).labelled_by(custom.id);
             });
         }
         Format::Special(n) => {
@@ -1437,8 +1516,8 @@ fn format_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(tl!("Mask:"));
-                ui.add(crate::widgets::line(m).desired_width(160.0));
+                let mask = ui.label(tl!("Mask:"));
+                ui.add(crate::widgets::line(m).desired_width(160.0)).labelled_by(mask.id);
             });
             ui.label(egui::RichText::new(tl!("9 digit, A letter, O letter or digit, X any character")).small().color(t.text_faint));
             if idx < 4 {
@@ -1483,21 +1562,27 @@ fn validate_tab(ui: &mut egui::Ui, d: &mut FieldDraft) {
 
 fn actions_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) {
     use pdfcraft_engine::FieldTrigger as T;
-    ui.label(egui::RichText::new(tl!("Add an Action")).font(theme::semibold(13.0)));
+    let editing = d.editing.is_some();
+    ui.label(egui::RichText::new(if editing { tl!("Edit Action") } else { tl!("Add an Action") }).font(theme::semibold(13.0)));
     let a = &mut d.new_action;
     egui::Grid::new("field-actions-add").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label(tl!("Select Trigger:"));
-        egui::ComboBox::from_id_salt("action-trigger").selected_text(tl!(a.trigger.label())).width(220.0).show_ui(ui, |ui| {
-            for tr in T::ALL {
-                ui.selectable_value(&mut a.trigger, tr, tl!(tr.label()));
-            }
+        // Editing changes the script of one trigger's action: its trigger and kind stay.
+        ui.add_enabled_ui(!editing, |ui| {
+            egui::ComboBox::from_id_salt("action-trigger").selected_text(tl!(a.trigger.label())).width(220.0).show_ui(ui, |ui| {
+                for tr in T::ALL {
+                    ui.selectable_value(&mut a.trigger, tr, tl!(tr.label()));
+                }
+            });
         });
         ui.end_row();
         ui.label(tl!("Select Action:"));
-        egui::ComboBox::from_id_salt("action-kind").selected_text(tl!(ACTION_KINDS[a.kind])).width(220.0).show_ui(ui, |ui| {
-            for (i, k) in ACTION_KINDS.iter().enumerate() {
-                ui.selectable_value(&mut a.kind, i, tl!(k));
-            }
+        ui.add_enabled_ui(!editing, |ui| {
+            egui::ComboBox::from_id_salt("action-kind").selected_text(tl!(ACTION_KINDS[a.kind])).width(220.0).show_ui(ui, |ui| {
+                for (i, k) in ACTION_KINDS.iter().enumerate() {
+                    ui.selectable_value(&mut a.kind, i, tl!(k));
+                }
+            });
         });
         ui.end_row();
         let hint = match a.kind {
@@ -1518,7 +1603,12 @@ fn actions_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) 
         ui.end_row();
     });
     let mut error = None;
-    if ui.button(tl!("Add")).clicked() {
+    let (mut commit, mut discard) = (false, false);
+    ui.horizontal(|ui| {
+        commit = ui.button(if editing { tl!("Update") } else { tl!("Add") }).clicked();
+        discard = editing && ui.button(tl!("Discard")).clicked();
+    });
+    if commit {
         match d.new_action.action() {
             Ok(act) => {
                 let tr = d.new_action.trigger;
@@ -1526,9 +1616,14 @@ fn actions_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) 
                 d.actions.push((tr, act));
                 d.actions.sort_by_key(|(x, _)| T::ALL.iter().position(|y| y == x));
                 d.new_action.text.clear();
+                d.editing = None;
             }
             Err(e) => error = Some(e),
         }
+    }
+    if discard {
+        d.new_action = ActionDraft::default();
+        d.editing = None;
     }
     if let Some(e) = error {
         ui.label(egui::RichText::new(tl!(&e)).small().color(t.text_muted));
@@ -1540,19 +1635,40 @@ fn actions_tab(ui: &mut egui::Ui, d: &mut FieldDraft, t: &crate::theme::Tokens) 
         if d.actions.is_empty() {
             ui.label(egui::RichText::new(tl!("No actions")).color(t.text_muted));
         }
-        let mut remove = None;
+        let (mut remove, mut edit) = (None, None);
         for (i, (tr, act)) in d.actions.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!(tr.label())).strong());
-                ui.label(act.describe());
+                let more = d.chained.iter().find(|(x, _)| x == tr).map_or(0, |(_, n)| *n);
+                if more == 0 {
+                    ui.label(act.describe());
+                } else {
+                    let then = crate::i18n::trn(crate::i18n::current(), more as u64, "then {n} more action", "then {n} more actions");
+                    ui.label(format!("{}, {then}", act.describe()));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.push_id(i, |ui| ui.button(tl!("Delete"))).inner.clicked() {
-                        remove = Some(i);
-                    }
+                    ui.push_id(i, |ui| {
+                        if ui.button(tl!("Delete")).clicked() {
+                            remove = Some(i);
+                        }
+                        if let pdfcraft_engine::FieldAction::JavaScript(js) = act
+                            && ui.add_enabled(d.editing.is_none(), egui::Button::new(tl!("Edit"))).clicked()
+                        {
+                            edit = Some((*tr, js.clone()));
+                        }
+                    });
                 });
             });
         }
+        if let Some((trigger, text)) = edit {
+            d.new_action = ActionDraft { trigger, kind: 0, text };
+            d.editing = Some(trigger);
+        }
         if let Some(i) = remove {
+            if d.actions.get(i).map(|(x, _)| Some(*x)) == Some(d.editing) {
+                d.new_action = ActionDraft::default();
+                d.editing = None;
+            }
             d.actions.remove(i);
         }
     });

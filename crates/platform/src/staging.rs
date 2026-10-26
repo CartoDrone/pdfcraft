@@ -193,6 +193,34 @@ pub fn write_atomically_with(
     result
 }
 
+/// Publish `bytes` under `target`'s name without ever replacing an existing file, even one a
+/// concurrent writer wins a race to create: `target` itself if that name is free, else
+/// `{stem} ({n}){ext}` for the first free `n` from 2, up to 10,000. The write goes through a
+/// temporary file in `target`'s folder (created if needed) and an atomic, no-clobber rename
+/// (`persist_noclobber`), so a half-written file is never visible at any candidate name. Shared by
+/// the automation batch tools and the desktop app's own batch file writers (recognizing several
+/// scans, say), so neither one replaces a file the other, or the document's own source, already
+/// put there.
+pub fn publish(target: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    let stem = target.file_stem().ok_or_else(|| std::io::Error::other("output has no stem"))?.to_string_lossy().into_owned();
+    let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for n in 1..=10_000u32 {
+        let candidate = if n == 1 { target.to_path_buf() } else { dir.join(format!("{stem} ({n}){ext}")) };
+        match temp.persist_noclobber(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists || candidate.symlink_metadata().is_ok() => temp = e.file,
+            Err(e) => return Err(e.error),
+        }
+    }
+    Err(std::io::Error::other("every numbered name up to (10000) is occupied"))
+}
+
 /// Copy accessible macOS attributes to the staging descriptor before publication. The kernel
 /// hides compression bookkeeping unless SHOWCOMPRESSION is requested; leave that option off.
 /// Provenance is managed by macOS for the new file, not writable document metadata.
@@ -741,6 +769,35 @@ mod tests {
         assert_eq!(std::fs::read(&link).unwrap(), b"NEW");
         assert_eq!(std::fs::read(&referent).unwrap(), b"OLD", "the file the link pointed to is untouched");
         assert_ne!(std::fs::metadata(&referent).unwrap().file_attributes() & HIDDEN, 0, "and still hidden");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `publish`: a free name is taken as given; a taken one, including the document's own source
+    /// file sitting at that exact path, gets the next free numbered name instead of being replaced.
+    #[test]
+    fn publish_never_replaces_a_file_already_at_the_name() {
+        let dir = test_dir("publish");
+        let target = dir.join("report.pdf");
+        let first = publish(&target, b"FIRST").unwrap();
+        assert_eq!(first, target, "a free name is taken as given");
+        assert_eq!(std::fs::read(&target).unwrap(), b"FIRST");
+        // A second publish under the same name (the source file, or an earlier run's output)
+        // never replaces it.
+        let second = publish(&target, b"SECOND").unwrap();
+        assert_eq!(file_name(&second), "report (2).pdf");
+        assert_eq!(std::fs::read(&target).unwrap(), b"FIRST", "the first file is untouched");
+        assert_eq!(std::fs::read(&second).unwrap(), b"SECOND");
+        // A name already taken by an unrelated file (not one `publish` itself created) is also
+        // skipped, not replaced.
+        std::fs::write(dir.join("report (3).pdf"), b"UNRELATED").unwrap();
+        let third = publish(&target, b"THIRD").unwrap();
+        assert_eq!(file_name(&third), "report (4).pdf");
+        assert_eq!(std::fs::read(dir.join("report (3).pdf")).unwrap(), b"UNRELATED");
+        assert_eq!(std::fs::read(&third).unwrap(), b"THIRD");
+        // The folder is created if it does not exist yet.
+        let nested = dir.join("out").join("nested.pdf");
+        assert_eq!(publish(&nested, b"NESTED").unwrap(), nested);
+        assert_eq!(std::fs::read(&nested).unwrap(), b"NESTED");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

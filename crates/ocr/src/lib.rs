@@ -99,6 +99,24 @@ pub fn preferred_letters(language: &str) -> &'static str {
     }
 }
 
+/// Swap the look-alikes the Latin recogniser picks for Danish and Norwegian å and ø: it reads
+/// "på" as "pà" or "pä" and "fører" as "förer". Neither language writes à á â ä ã ö ő, so the swap
+/// cannot break a correct word; Swedish, Finnish and German keep their ä and ö.
+pub fn native_letters(language: &str, text: String) -> String {
+    if !matches!(language, "da" | "no") {
+        return text;
+    }
+    text.chars()
+        .map(|c| match c {
+            'à' | 'á' | 'â' | 'ä' | 'ã' => 'å',
+            'À' | 'Á' | 'Â' | 'Ä' | 'Ã' => 'Å',
+            'ö' | 'ő' => 'ø',
+            'Ö' | 'Ő' => 'Ø',
+            c => c,
+        })
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OcrError {
     /// Shown to end users (release packages ship the models; a source build fetches them with
@@ -206,6 +224,7 @@ pub struct Ocr {
     /// Letters this document language prefers when two readings are close. Empty for English,
     /// Chinese and the unrestricted Latin choice.
     preferred: &'static str,
+    language: &'static str,
 }
 
 impl Ocr {
@@ -224,7 +243,7 @@ impl Ocr {
             ..Default::default()
         };
         let engine = ocrs::OcrEngine::new(params).map_err(|e| OcrError::Load("ocr engine".into(), e.to_string()))?;
-        Ok(Ocr { engine, ppocr, preferred: preferred_letters(models.language) })
+        Ok(Ocr { engine, ppocr, preferred: preferred_letters(models.language), language: models.language })
     }
 
     /// Load the models found by [`Models::find`].
@@ -277,7 +296,7 @@ impl Ocr {
                     .fold(None, |rect: Option<rten_imageproc::Rect<f32>>, r| Some(rect.map_or(r, |b| b.union(r))));
                 let Some(r) = rect else { continue };
                 let rect = [r.left(), r.top(), r.right(), r.bottom()];
-                let text = ppocr.recognize(&rgb, width, height, rect, self.preferred)?;
+                let text = native_letters(self.language, ppocr.recognize(&rgb, width, height, rect, self.preferred)?);
                 if !text.is_empty() {
                     result.push(Line { words: vec![Word { text, rect }] });
                 }
@@ -622,6 +641,17 @@ mod tests {
         assert!(preferred_letters("fr").contains('ç') && preferred_letters("fr").contains('ù'));
         assert!(preferred_letters("da").contains('å') && !preferred_letters("da").contains('à'));
         assert!(preferred_letters("la").is_empty() && preferred_letters("en").is_empty());
+    }
+
+    #[test]
+    fn danish_and_norwegian_swap_look_alikes_for_their_own_letters() {
+        let read = "pà sà ogsà fär mäske gá Àrhus Öst fører";
+        for language in ["da", "no"] {
+            assert_eq!(native_letters(language, read.into()), "på så også får måske gå Århus Øst fører");
+        }
+        for language in ["sv", "fi", "de", "fr", "en"] {
+            assert_eq!(native_letters(language, read.into()), read);
+        }
     }
 
     #[test]
